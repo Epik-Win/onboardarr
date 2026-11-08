@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pending_wizarr_invites.json
+plex_invite_targets.json

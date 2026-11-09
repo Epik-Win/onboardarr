@@ -16,7 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import discord
 from discord.ext import commands
@@ -30,6 +32,36 @@ DEFAULT_PLEX_URL = os.environ.get("PLEX_URL", "http://localhost:32400")
 DEFAULT_PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 DEFAULT_COMPOSE_FILE = Path("/opt/music_server.docker-compose.yml")
 DEFAULT_MUSIC_SERVER_ENV_FILE = Path("/opt/music_server.env")
+
+
+def telegram_api_call(token: str, method: str, payload: Dict[str, Any]) -> Any:
+    request = Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=urlencode(payload).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(request, timeout=35) as response:
+            result = json.loads(response.read().decode())
+    except HTTPError as exc:
+        raise RuntimeError(f"Telegram {method} request failed with HTTP {exc.code}") from None
+    except URLError as exc:
+        raise RuntimeError(f"Telegram {method} request failed: {exc.reason}") from None
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram {method} request failed: {result}")
+    return result.get("result")
+
+
+def parse_telegram_chat_ids(value: str) -> set[int]:
+    chat_ids = set()
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            try:
+                chat_ids.add(int(item))
+            except ValueError as exc:
+                raise ValueError(f"Invalid Telegram chat ID: {item}") from exc
+    return chat_ids
 
 
 def music_server_env_file() -> Path:
@@ -1025,6 +1057,12 @@ class OnBoardarrClient(commands.Bot):
             pass
         super().__init__(command_prefix="!", intents=intents, **kwargs)
         self._discord_client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
+        self._telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self._telegram_admin_chat_ids = parse_telegram_chat_ids(
+            os.getenv("TELEGRAM_ADMIN_CHAT_IDS", ""),
+        )
+        self._telegram_offset = 0
+        self._telegram_invite_urls: Dict[int, str] = {}
         self._plex_invite_url = os.getenv("PLEX_INVITE_URL", "").strip()
         self._wizarr_api_base_url = os.getenv("WIZARR_API_BASE_URL", "http://wizarr:5690").strip()
         self._wizarr_public_base_url = os.getenv("WIZARR_PUBLIC_BASE_URL", os.getenv("PLEX_INVITE_URL", "")).strip()
@@ -1369,6 +1407,214 @@ class OnBoardarrClient(commands.Bot):
 
         raise RuntimeError("Could not create an invite in any text channel - missing permissions or channels")
 
+    async def _telegram_send(self, chat_id: int, text: str) -> None:
+        if not self._telegram_token:
+            return
+        for start in range(0, len(text), 4000):
+            await asyncio.to_thread(
+                telegram_api_call,
+                self._telegram_token,
+                "sendMessage",
+                {"chat_id": chat_id, "text": text[start:start + 4000]},
+            )
+
+    async def _telegram_notify_admins(self, text: str) -> None:
+        if not self._telegram_token:
+            return
+        for chat_id in self._telegram_admin_chat_ids:
+            try:
+                await self._telegram_send(chat_id, text)
+            except Exception as exc:
+                print(f"Failed to send Telegram admin notification: {exc}")
+
+    async def _telegram_poll_loop(self) -> None:
+        if not self._telegram_token:
+            return
+        await self.wait_until_ready()
+
+        print("Telegram bot polling enabled")
+        observed_chat_ids = set()
+        while True:
+            try:
+                updates = await asyncio.to_thread(
+                    telegram_api_call,
+                    self._telegram_token,
+                    "getUpdates",
+                    {"offset": self._telegram_offset, "timeout": 25},
+                )
+                for update in updates or []:
+                    self._telegram_offset = max(
+                        self._telegram_offset, int(update.get("update_id", 0)) + 1,
+                    )
+                    message = update.get("message") or update.get("edited_message")
+                    if not message or not message.get("text"):
+                        continue
+                    chat_id = int(message.get("chat", {}).get("id", 0))
+                    if chat_id not in self._telegram_admin_chat_ids:
+                        if chat_id not in observed_chat_ids:
+                            print(f"Telegram chat ID observed: {chat_id}; authorize it in TELEGRAM_ADMIN_CHAT_IDS")
+                            observed_chat_ids.add(chat_id)
+                        continue
+                    try:
+                        await self._handle_telegram_message(chat_id, message["text"])
+                    except Exception as exc:
+                        print(f"Telegram command failed: {exc}")
+                        await self._telegram_send(chat_id, "The command failed. Check the Onboardarr logs.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"Telegram polling failed: {exc}")
+                await asyncio.sleep(10)
+
+    async def _handle_telegram_message(self, chat_id: int, text: str) -> None:
+        parts = text.strip().split(maxsplit=1)
+        if not parts:
+            return
+        command = parts[0].split("@", 1)[0].lower()
+        argument = parts[1].strip() if len(parts) > 1 else ""
+
+        if command in ("/start", "/help"):
+            await self._telegram_send(chat_id, (
+                "Onboardarr admin commands:\n"
+                "/plex-invite [days] — create a single-use Discord invite; "
+                "the next joiner receives a Wizarr/Plex invite\n"
+                "/reset-welcome — resend the current welcome guide to Discord members\n"
+                "/status — show service connectivity"
+            ))
+            return
+
+        if command == "/status":
+            await self._telegram_send(chat_id, (
+                f"Onboardarr is online. Discord: {'connected' if self.is_ready() else 'connecting'}; "
+                f"Wizarr: {self._wizarr_api_base_url}; Plex: {self._plex_server_name_override}."
+            ))
+            return
+
+        if command == "/reset-welcome":
+            guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
+            guild = self.get_guild(int(guild_id)) if guild_id else None
+            if guild is None:
+                await self._telegram_send(chat_id, "The configured Discord server is unavailable.")
+                return
+            deleted, resent, failed = await self._reset_welcome_messages_for_guild(guild)
+            await self._telegram_send(
+                chat_id,
+                f"Reset complete: deleted {deleted} bot DM messages, resent welcome messages "
+                f"to {resent} members, and failed for {failed}.",
+            )
+            return
+
+        if command not in ("/plex-invite", "/invite"):
+            await self._telegram_send(chat_id, "Unknown command. Send /help for available commands.")
+            return
+
+        duration_days = None
+        if argument:
+            try:
+                duration_days = int(argument)
+            except ValueError:
+                await self._telegram_send(chat_id, "Usage: /plex-invite [positive number of days]")
+                return
+            if duration_days < 1:
+                await self._telegram_send(chat_id, "Invite duration must be at least one day.")
+                return
+
+        try:
+            cleanup_wizarr_invitations(
+                self._wizarr_api_base_url, self._resolve_wizarr_api_key(),
+            )
+        except Exception as exc:
+            print(f"Telegram Wizarr invite cleanup failed: {exc}")
+
+        previous_invite = self._telegram_invite_urls.get(chat_id)
+        if previous_invite:
+            await self._revoke_discord_invite(previous_invite)
+
+        try:
+            discord_invite_url = await self._create_discord_invite()
+        except Exception as exc:
+            await self._telegram_send(chat_id, f"Could not create a Discord invite: {exc}")
+            return
+
+        self._pending_wizarr_duration = duration_days
+        self._telegram_invite_urls[chat_id] = discord_invite_url
+        duration_note = (
+            f"The next joiner will receive a Plex invite valid for {duration_days} days."
+            if duration_days else
+            "The next joiner will receive an unlimited Plex invite."
+        )
+        await self._telegram_send(
+            chat_id,
+            f"Share this single-use Discord invite (expires in 24 hours):\n{discord_invite_url}\n\n"
+            f"{duration_note}",
+        )
+
+    async def _reset_welcome_messages_for_guild(
+        self, guild: discord.Guild,
+    ) -> tuple[int, int, int]:
+        deleted_count = 0
+        resent_count = 0
+        failed_count = 0
+        try:
+            members = [member for member in guild.members if not member.bot]
+            if not members:
+                members = [member for member in await guild.fetch_members(limit=None) if not member.bot]
+        except Exception:
+            members = [member for member in guild.members if not member.bot]
+
+        music_preferred_names = [
+            os.getenv("DISCORD_MAIN_CHANNEL", "").strip(),
+            os.getenv("DISCORD_MAIN_CHANNEL_NAME", "").strip(),
+            "music_request",
+            "music-requests",
+            "music_requests",
+        ]
+        bug_preferred_names = [
+            os.getenv("DISCORD_BUG_CHANNEL", "").strip(),
+            os.getenv("DISCORD_BUG_CHANNEL_ID", "").strip(),
+            "bug-reports",
+            "bug_reports",
+        ]
+
+        for member in members:
+            try:
+                deleted_count += await self._delete_all_bot_dm_messages(member)
+                channel_reference = self._resolve_named_channel_reference_for_viewer(
+                    guild, member, music_preferred_names, "#music_request",
+                )
+                bug_channel_reference = self._resolve_named_channel_reference_for_viewer(
+                    guild, member, bug_preferred_names, "#bug-reports",
+                )
+                (
+                    server_intro_message,
+                    main_message,
+                    mobile_shortcut_message,
+                    watch_party_message,
+                    bug_report_message,
+                ) = build_welcome_message(channel_reference, bug_channel_reference)
+                server_intro_message = (
+                    "🔄 Our welcome message has been updated — here's the latest version:\n\n"
+                    f"{server_intro_message}"
+                )
+                try:
+                    for chunk in (
+                        server_intro_message,
+                        main_message,
+                        mobile_shortcut_message,
+                        watch_party_message,
+                        bug_report_message,
+                    ):
+                        for start in range(0, len(chunk), 2000):
+                            await member.send(chunk[start:start + 2000], suppress_embeds=True)
+                    resent_count += 1
+                except Exception as exc:
+                    print(f"reset-welcome: failed to DM {member} ({member.id}): {exc}")
+                    failed_count += 1
+            except Exception:
+                failed_count += 1
+
+        return deleted_count, resent_count, failed_count
+
     async def setup_hook(self) -> None:
         @self.tree.command(name="plex-invite", description="Get the Discord server invite link to share with others")
         @discord.app_commands.describe(days="Temporary Plex access duration in days. Leave empty for unlimited access.")
@@ -1438,70 +1684,9 @@ class OnBoardarrClient(commands.Bot):
                 return
 
             await interaction.response.defer(ephemeral=True)
-
-            deleted_count = 0
-            resent_count = 0
-            failed_count = 0
-
-            # Ensure we have the current member list.
-            try:
-                members = [m for m in interaction.guild.members if not m.bot]
-                if not members:
-                    members = [m for m in await interaction.guild.fetch_members(limit=None) if not m.bot]
-            except Exception:
-                members = [m for m in interaction.guild.members if not m.bot]
-
-            music_preferred_names = [
-                os.getenv("DISCORD_MAIN_CHANNEL", "").strip(),
-                os.getenv("DISCORD_MAIN_CHANNEL_NAME", "").strip(),
-                "music_request",
-                "music-requests",
-                "music_requests",
-            ]
-            bug_preferred_names = [
-                os.getenv("DISCORD_BUG_CHANNEL", "").strip(),
-                os.getenv("DISCORD_BUG_CHANNEL_ID", "").strip(),
-                "bug-reports",
-                "bug_reports",
-            ]
-
-            for member in members:
-                try:
-                    deleted_count += await self._delete_all_bot_dm_messages(member)
-                    channel_reference = self._resolve_named_channel_reference_for_viewer(
-                        interaction.guild, member, music_preferred_names, "#music_request",
-                    )
-                    bug_channel_reference = self._resolve_named_channel_reference_for_viewer(
-                        interaction.guild, member, bug_preferred_names, "#bug-reports",
-                    )
-                    (
-                        server_intro_message,
-                        main_message,
-                        mobile_shortcut_message,
-                        watch_party_message,
-                        bug_report_message,
-                    ) = build_welcome_message(channel_reference, bug_channel_reference)
-                    server_intro_message = (
-                        "🔄 Our welcome message has been updated — here's the latest version:\n\n"
-                        f"{server_intro_message}"
-                    )
-                    try:
-                        for chunk in (
-                            server_intro_message,
-                            main_message,
-                            mobile_shortcut_message,
-                            watch_party_message,
-                            bug_report_message,
-                        ):
-                            for i in range(0, len(chunk), 2000):
-                                await member.send(chunk[i:i + 2000], suppress_embeds=True)
-                        resent_count += 1
-                    except Exception as exc:
-                        print(f"reset-welcome: failed to DM {member} ({member.id}): {exc}")
-                        failed_count += 1
-                except Exception:
-                    failed_count += 1
-
+            deleted_count, resent_count, failed_count = (
+                await self._reset_welcome_messages_for_guild(interaction.guild)
+            )
             await interaction.followup.send(
                 f"Reset complete: deleted {deleted_count} bot DM messages, resent welcome message to {resent_count} users, failed for {failed_count} users.",
                 ephemeral=True,
@@ -1533,6 +1718,8 @@ class OnBoardarrClient(commands.Bot):
             asyncio.create_task(self._start_wizarr_webhook())
         except Exception:
             pass
+        if self._telegram_token:
+            asyncio.create_task(self._telegram_poll_loop())
 
     async def on_member_join(self, member: discord.Member) -> None:
         if member.bot:
@@ -1614,6 +1801,11 @@ class OnBoardarrClient(commands.Bot):
             print(f"Sent Plex/Wizarr invite DM to {member.display_name} ({member.id})")
         except Exception as exc:
             print(f"Failed to send Plex/Wizarr invite DM to {member.display_name}: {exc}")
+
+        await self._telegram_notify_admins(
+            f"New Discord member: {member.display_name} ({member.id}). "
+            f"Wizarr/Plex invite {'sent' if invite_url else 'could not be generated'}."
+        )
 
         try:
             asyncio.create_task(self._delayed_pending_invite_check(5))

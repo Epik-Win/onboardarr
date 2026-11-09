@@ -1,48 +1,138 @@
-# OnBoardarr
+# Onboardarr
 
-OnBoardarr automates Discord member onboarding for Plex and Wizarr. It can
-create invitations, reconcile accepted invites, maintain Discord-to-Plex
-account mappings, and send configurable setup guidance to new members.
+Onboardarr automates Discord member onboarding for Plex and Wizarr. It creates
+and reconciles invitations, maintains Discord-to-Plex account mappings, and
+sends configurable setup guidance to new members.
 
 ## Requirements
 
 - Python 3.12
-- `discord.py`; install `aiohttp` to enable the Wizarr webhook listener
-- A Discord application/bot and a configured Wizarr instance
-- Plex credentials and writable persistent storage for invite state/mappings
+- A Discord application and bot added to the target server
+- A reachable Plex server and Wizarr instance
+- Access to the Wizarr database file and writable storage for mapping files
 
-Install the basic dependency with:
+Install dependencies:
 
 ```sh
-python -m pip install discord.py aiohttp
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install discord.py plexapi aiohttp
 ```
 
-## Configuration
+`aiohttp` is needed for the optional Wizarr webhook listener.
 
-Provide settings in the dotenv-style file passed with `--env-file` (default:
-`/opt/onboardarr/.env`) or through the process environment. At minimum,
-configure `DISCORD_BOT_TOKEN`, `WIZARR_API_BASE_URL`, `WIZARR_API_KEY`,
-`WIZARR_DB_FILE`, `PLEX_URL`, and `PLEX_TOKEN`.
+## Configure and run
 
-Useful optional settings include:
+Create a private dotenv-style file, for example `.env`, and set the service
+credentials and endpoints:
 
-- `PLEX_SERVER_NAME`, `PLEX_INVITE_URL`, and `WIZARR_PUBLIC_BASE_URL`
-- `WIZARR_MAPPING_FILE` and `PENDING_WIZARR_INVITES_FILE`
-- `MUSIC_SERVER_ENV_FILE` and `MUSIC_SERVER_COMPOSE_FILE` for integrations
-  that update and restart a separate music service
-- `SEERR_URL`, `AUDIOBOOK_REQUEST_URL`, `DISCORD_MAIN_CHANNEL`,
-  `DISCORD_BUG_CHANNEL`, and `DISCORD_BUG_CHANNEL_ID` for welcome messages
-- `WIZARR_WEBHOOK_PORT` and `WIZARR_WEBHOOK_PATH`
+```dotenv
+DISCORD_BOT_TOKEN=replace-with-your-bot-token
+DISCORD_GUILD_ID=replace-with-your-server-id
+DISCORD_CLIENT_ID=replace-with-your-application-id
 
-Mount secrets and persistent data separately from the source tree. Do not
-commit `.env`, invite records, account mappings, or service credentials.
+WIZARR_API_BASE_URL=http://wizarr:5690
+WIZARR_API_KEY=replace-with-your-wizarr-api-key
+WIZARR_DB_FILE=/path/to/wizarr/database.db
 
-## Helpers and tests
+PLEX_URL=http://plex:32400
+PLEX_TOKEN=replace-with-your-plex-token
+PLEX_SERVER_NAME=Plex
 
-`sync_plex_invite_mapping.py` reconciles invite targets with the Discord-to-Plex
-mapping. `watch_wizarr_invite.py` is a retrying wrapper for that helper.
+# Optional Telegram admin bot
+TELEGRAM_BOT_TOKEN=replace-with-a-dedicated-telegram-bot-token
+TELEGRAM_ADMIN_CHAT_IDS=replace-with-your-telegram-chat-id
+```
 
-Run the mapping tests with:
+The database path must be readable by the process. The default mapping paths
+are `/opt/wizarr/plex_invite_targets.json` and
+`/opt/wizarr/pending_wizarr_invites.json`; configure
+`WIZARR_MAPPING_FILE` and `PENDING_WIZARR_INVITES_FILE` if those locations are
+not persistent or writable in your deployment.
+
+Start the bot:
+
+```sh
+python onboardarr.py --env-file .env
+```
+
+The default environment file is `/opt/onboardarr/.env`. The bot provides the
+`/plex-invite` command to the server owner and `/reset-welcome` to the server
+owner or an administrator. It sends setup instructions to new members and
+processes pending Wizarr invitations in the background.
+
+If existing-member reconciliation requires Discord member/message access,
+enable `DISCORD_ENABLE_PRIVILEGED_INTENTS=true` and enable the corresponding
+privileged intents for the bot in the Discord Developer Portal. Keep the
+setting off if those intents are not needed.
+
+## Telegram admin bot
+
+Telegram support is optional. Configure a bot token and numeric
+`TELEGRAM_ADMIN_CHAT_IDS` (comma-separated for multiple admin chats). Telegram
+admins can use `/plex-invite [days]` to create the same single-use Discord
+invite as the Discord command, and `/status` or `/help` for basic bot
+information. `/reset-welcome` resends the current onboarding instructions to
+all Discord members; use it carefully because it deletes and replaces the
+bot's onboarding DMs. Onboardarr sends Telegram admins a notice when a Discord
+member joins and whether the Wizarr invite was generated.
+
+To find a chat ID, start the bot and message it once; an unauthorized chat's
+numeric ID is printed to the Onboardarr log. Add the ID to the allow-list and
+restart. Telegram commands are restricted to this list. Remove any webhook
+configured for the bot because Onboardarr uses long polling. Use a different
+bot token from Debugarr and Checkrr if those integrations are enabled; they
+also poll Telegram updates.
+
+## Mapping helper
+
+`sync_plex_invite_mapping.py` reconciles invite targets with the
+Discord-to-Plex mapping. `watch_wizarr_invite.py` retries that helper when
+needed. To run a one-time mapping reconciliation without starting the bot:
+
+```sh
+python onboardarr.py --env-file .env --dry-run
+```
+
+Despite the option name, this command writes the reconciled mapping outputs;
+it is not a read-only preview. Back up existing mapping files before using it
+if you need to preserve their current contents.
+
+## Optional settings
+
+- `PLEX_INVITE_URL` and `WIZARR_PUBLIC_BASE_URL` for public invite links.
+- `WIZARR_SERVER_ID` when the server ID should be specified explicitly.
+- `WIZARR_WEBHOOK_PORT` and `WIZARR_WEBHOOK_PATH` for the optional webhook
+  listener (defaults: `8081` and `/wizarr/webhook`).
+- `DISCORD_MAIN_CHANNEL`, `DISCORD_BUG_CHANNEL`, and
+  `DISCORD_BUG_CHANNEL_ID` for welcome-message destinations.
+- `SEERR_URL` and `AUDIOBOOK_REQUEST_URL` for links in welcome messages.
+- `MUSIC_SERVER_ENV_FILE` and `MUSIC_SERVER_COMPOSE_FILE` when using the
+  optional music-service mapping integration.
+
+Restrict webhook access to trusted services. Keep credentials, invite records,
+and account mappings out of version control.
+
+## Docker image
+
+Each push to `main` publishes a multi-architecture image to GitHub Container
+Registry. Pull and run the image with a mounted environment file and persistent
+Wizarr storage:
+
+```sh
+docker pull ghcr.io/epik-win/onboardarr:latest
+docker run -d --name onboardarr \
+  --restart unless-stopped \
+  -v "$PWD/.env:/run/secrets/onboardarr.env:ro" \
+  -v /path/to/wizarr:/opt/wizarr \
+  -v /path/to/music-server.env:/opt/music_server.env:ro \
+  ghcr.io/epik-win/onboardarr:latest
+```
+
+The image is also tagged with the source commit SHA for immutable deployments.
+Keep credentials and writable application data outside the image.
+
+## Tests
 
 ```sh
 python -m pytest -q

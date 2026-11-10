@@ -22,6 +22,13 @@ from urllib.request import Request, urlopen
 
 import discord
 from discord.ext import commands
+from invite_languages import (
+    INVITE_LANGUAGE_LABELS,
+    format_plex_invite_message,
+    format_plex_invite_unavailable_message,
+    normalize_invite_language,
+    parse_invite_options,
+)
 
 # Lazy import for aiohttp will be done when starting the webhook server
 
@@ -1072,6 +1079,7 @@ class OnBoardarrClient(commands.Bot):
         self._plex_server_name_override = os.getenv("PLEX_SERVER_NAME", "Plex").strip() or "Plex"
         self._plex_server_name_cache: Optional[str] = None
         self._pending_wizarr_duration: Optional[int] = None
+        self._pending_wizarr_language = "en"
         self._music_server_env_path = music_server_env_file()
         self._wizarr_mapping_path = Path(os.getenv("WIZARR_MAPPING_FILE", str(DEFAULT_MAPPING_FILE)))
         self._pending_wizarr_invites_path = Path(os.getenv("PENDING_WIZARR_INVITES_FILE", str(DEFAULT_PENDING_INVITES_FILE)))
@@ -1124,6 +1132,11 @@ class OnBoardarrClient(commands.Bot):
         duration_days = self._pending_wizarr_duration
         self._pending_wizarr_duration = None
         return duration_days
+
+    def _consume_pending_wizarr_language(self) -> str:
+        language = self._pending_wizarr_language
+        self._pending_wizarr_language = "en"
+        return language
 
     def _resolve_named_channel_reference(self, guild: Optional[discord.Guild], preferred_names: List[str], fallback: str) -> str:
         if guild is None:
@@ -1476,8 +1489,8 @@ class OnBoardarrClient(commands.Bot):
         if command in ("/start", "/help"):
             await self._telegram_send(chat_id, (
                 "Onboardarr admin commands:\n"
-                "/plex-invite [days] — create a single-use Discord invite; "
-                "the next joiner receives a Wizarr/Plex invite\n"
+                "/plex-invite [days] [language] — create an invite; "
+                "languages: en, es, fr, de (example: /plex-invite 14 es)\n"
                 "/reset-welcome — resend the current welcome guide to Discord members\n"
                 "/status — show service connectivity"
             ))
@@ -1508,16 +1521,14 @@ class OnBoardarrClient(commands.Bot):
             await self._telegram_send(chat_id, "Unknown command. Send /help for available commands.")
             return
 
-        duration_days = None
-        if argument:
-            try:
-                duration_days = int(argument)
-            except ValueError:
-                await self._telegram_send(chat_id, "Usage: /plex-invite [positive number of days]")
-                return
-            if duration_days < 1:
-                await self._telegram_send(chat_id, "Invite duration must be at least one day.")
-                return
+        try:
+            duration_days, language = parse_invite_options(argument)
+        except ValueError as exc:
+            await self._telegram_send(
+                chat_id,
+                f"{exc}\nUsage: /plex-invite [days] [language] (en, es, fr, de)",
+            )
+            return
 
         try:
             cleanup_wizarr_invitations(
@@ -1536,7 +1547,6 @@ class OnBoardarrClient(commands.Bot):
             await self._telegram_send(chat_id, f"Could not create a Discord invite: {exc}")
             return
 
-        self._pending_wizarr_duration = duration_days
         self._telegram_invite_urls[chat_id] = discord_invite_url
         duration_note = (
             f"The next joiner will receive a Plex invite valid for {duration_days} days."
@@ -1546,8 +1556,11 @@ class OnBoardarrClient(commands.Bot):
         await self._telegram_send(
             chat_id,
             f"Share this single-use Discord invite (expires in 24 hours):\n{discord_invite_url}\n\n"
-            f"{duration_note}",
+            f"{duration_note}\nLanguage for the next joiner's Plex invite: "
+            f"{INVITE_LANGUAGE_LABELS[language]}.",
         )
+        self._pending_wizarr_duration = duration_days
+        self._pending_wizarr_language = language
 
     async def _reset_welcome_messages_for_guild(
         self, guild: discord.Guild,
@@ -1617,11 +1630,23 @@ class OnBoardarrClient(commands.Bot):
 
     async def setup_hook(self) -> None:
         @self.tree.command(name="plex-invite", description="Get the Discord server invite link to share with others")
-        @discord.app_commands.describe(days="Temporary Plex access duration in days. Leave empty for unlimited access.")
-        async def plex_invite(interaction: discord.Interaction, days: Optional[int] = None) -> None:
+        @discord.app_commands.describe(
+            days="Temporary Plex access duration in days. Leave empty for unlimited access.",
+            language="Language for the Plex/Wizarr invite message sent to the next joiner.",
+        )
+        @discord.app_commands.choices(language=[
+            discord.app_commands.Choice(name=label, value=code)
+            for code, label in INVITE_LANGUAGE_LABELS.items()
+        ])
+        async def plex_invite(
+            interaction: discord.Interaction,
+            days: Optional[int] = None,
+            language: str = "en",
+        ) -> None:
             if not self._is_server_owner(interaction):
                 await interaction.response.send_message("Only the Discord server owner can use this command.", ephemeral=True, suppress_embeds=True)
                 return
+            language = normalize_invite_language(language)
 
             await interaction.response.defer(ephemeral=True)
 
@@ -1634,10 +1659,6 @@ class OnBoardarrClient(commands.Bot):
                 cleanup_wizarr_invitations(self._wizarr_api_base_url, self._resolve_wizarr_api_key())
             except Exception:
                 pass
-
-            # Store a pending temporary duration for the next joining user.
-            if days is not None and days > 0:
-                self._pending_wizarr_duration = days
 
             # Create a single-use Discord invite for the configured guild
             try:
@@ -1671,6 +1692,8 @@ class OnBoardarrClient(commands.Bot):
                 await interaction.followup.send(f"I couldn't DM you the invite link: {exc}", ephemeral=True, suppress_embeds=True)
                 return
 
+            self._pending_wizarr_duration = days if days is not None and days > 0 else None
+            self._pending_wizarr_language = language
             await interaction.followup.send("I sent your Discord invite link to you privately.", ephemeral=True, suppress_embeds=True)
 
         @self.tree.command(name="reset-welcome", description="Delete all onboarding DMs and resend only the welcome instructions to all current users")
@@ -1725,6 +1748,7 @@ class OnBoardarrClient(commands.Bot):
         if member.bot:
             return
 
+        pending_language = self._consume_pending_wizarr_language()
         invite_url = self._plex_invite_url
         pending_duration = self._pending_wizarr_duration
         duration_days = None
@@ -1777,25 +1801,21 @@ class OnBoardarrClient(commands.Bot):
         except Exception:
             channel_mention = None
 
-        expires_text = (
-            f"This Plex invite grants access for {duration_days} days." if duration_days is not None else "This Plex invite grants indefinite access."
-        )
         channel_reference = channel_mention or "#music_request"
 
         try:
             dm_channel = member.dm_channel or await member.create_dm()
 
             if invite_url:
-                invite_message = (
-                    f"**Please join our {plex_name} Plex/Wizarr server first!**\n\n"
-                    f"**To Join, Here is Your {plex_name} Plex/Wizarr Invite:**\n{invite_url}\n{expires_text}"
+                invite_message = format_plex_invite_message(
+                    plex_name,
+                    invite_url,
+                    duration_days,
+                    pending_language,
                 )
                 await dm_channel.send(invite_message, suppress_embeds=True)
             elif invitation is not None:
-                invite_message = (
-                    f"**Please join our {plex_name} Plex/Wizarr server first!**\n\n"
-                    "I generated the invite, but could not format the invite URL. Please contact the admin."
-                )
+                invite_message = format_plex_invite_unavailable_message(pending_language)
                 await dm_channel.send(invite_message, suppress_embeds=True)
 
             print(f"Sent Plex/Wizarr invite DM to {member.display_name} ({member.id})")

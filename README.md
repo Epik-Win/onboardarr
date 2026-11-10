@@ -58,8 +58,11 @@ python onboardarr.py --env-file .env
 
 The default environment file is `/opt/onboardarr/.env`. The bot provides the
 `/plex-invite` command to the server owner and `/reset-welcome` to the server
-owner or an administrator. It sends setup instructions to new members and
-processes pending Wizarr invitations in the background.
+owner or an administrator. `/plex-invite` offers English, Spanish, French, and
+German for the Plex/Wizarr invite message sent to the next person who joins;
+English is the default. The longer onboarding guide remains in English. The
+bot also sends setup instructions to new members and processes pending Wizarr
+invitations in the background.
 
 If existing-member reconciliation requires Discord member/message access,
 enable `DISCORD_ENABLE_PRIVILEGED_INTENTS=true` and enable the corresponding
@@ -70,9 +73,12 @@ setting off if those intents are not needed.
 
 Telegram support is optional. Configure a bot token and numeric
 `TELEGRAM_ADMIN_CHAT_IDS` (comma-separated for multiple admin chats). Telegram
-admins can use `/plex-invite [days]` to create the same single-use Discord
-invite as the Discord command, and `/status` or `/help` for basic bot
-information. `/reset-welcome` resends the current onboarding instructions to
+admins can use `/plex-invite [days] [language]` to create the same single-use
+Discord invite as the Discord command. For example, `/plex-invite 14 es`
+creates a 14-day invite and sends the next joiner a Spanish Plex/Wizarr invite
+message. Supported language codes are `en`, `es`, `fr`, and `de`; omitting the
+language uses English. `/status` and `/help` show basic bot information.
+`/reset-welcome` resends the current onboarding instructions to
 all Discord members; use it carefully because it deletes and replaces the
 bot's onboarding DMs. Onboardarr sends Telegram admins a notice when a Discord
 member joins and whether the Wizarr invite was generated.
